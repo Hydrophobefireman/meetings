@@ -1,0 +1,10 @@
+node_modules/
+.sst/
+.wrangler/
+.env
+.env.*
+esbuild.json
+platform
+provider-lock.json
+*.log
+.DS_Store
