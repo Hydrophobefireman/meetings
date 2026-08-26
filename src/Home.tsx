@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Effect } from "effect";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -10,7 +11,7 @@ import {
 import { Calendar } from "@/components/ui/calendar";
 import { ArrowRight, CalendarIcon } from "lucide-react";
 import type { DateRange } from "react-day-picker";
-import { createEvent } from "./api";
+import { createEvent, BadRequest } from "./api";
 
 const iso = (d: Date) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
@@ -33,11 +34,18 @@ export default function Home() {
     if (!title.trim()) return setError("Give the event a name.");
     if (!range?.from || !range?.to) return setError("Pick a date range.");
     setBusy(true);
+
+    const program = createEvent(title.trim(), iso(range.from), iso(range.to));
+
     try {
-      const data = await createEvent(title.trim(), iso(range.from), iso(range.to));
+      const data = await Effect.runPromise(program);
       window.location.href = `/e/${data.id}`;
-    } catch {
-      setError("Could not create the event — check the date range.");
+    } catch (err) {
+      if (err instanceof BadRequest) {
+        setError("That date range doesn't look right — check the dates.");
+      } else {
+        setError("Could not create the event — check the date range.");
+      }
       setBusy(false);
     }
   }
@@ -52,7 +60,6 @@ export default function Home() {
           that{" "}
           <span className="relative whitespace-nowrap italic text-accent-foreground">
             work
-            {/* highlighter swipe under the word */}
             <svg
               aria-hidden="true"
               viewBox="0 0 120 12"
