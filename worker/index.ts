@@ -31,7 +31,8 @@ app.post("/api/events", async (c) => {
   if (!body) return c.json({ error: "bad_request" }, 400);
 
   const title = cleanTitle(body.title);
-  const days = normalizeDays(body.days);
+  // accepts { start, end } range or a legacy days array
+  const days = normalizeDays(body.days ?? body);
   if (!title || !days) return c.json({ error: "bad_request" }, 400);
 
   let id = rid(7);

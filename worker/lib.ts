@@ -26,7 +26,36 @@ export function rid(len: number): string {
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+/** Expand an inclusive [start, end] date range into a sorted list of ISO days. */
+export function expandRange(start: string, end: string): string[] | null {
+  if (!DATE_RE.test(start) || !DATE_RE.test(end)) return null;
+  const t1 = Date.parse(`${start}T00:00:00Z`);
+  const t2 = Date.parse(`${end}T00:00:00Z`);
+  if (!Number.isFinite(t1) || !Number.isFinite(t2) || t2 < t1) return null;
+  // round-trip check rejects things like 2026-02-31
+  if (
+    new Date(t1).toISOString().slice(0, 10) !== start ||
+    new Date(t2).toISOString().slice(0, 10) !== end
+  ) {
+    return null;
+  }
+  const days: string[] = [];
+  for (let t = t1; t <= t2; t += 86400000) {
+    days.push(new Date(t).toISOString().slice(0, 10));
+    // overflow guard for nonsense inputs like year 999999
+    if (days.length > 20000) return null;
+  }
+  return days;
+}
+
 export function normalizeDays(raw: unknown): string[] | null {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const { start, end } = raw as Record<string, unknown>;
+    if (typeof start === "string" && typeof end === "string") {
+      return expandRange(start, end);
+    }
+    return null;
+  }
   if (!Array.isArray(raw)) return null;
   const uniq = new Set<string>();
   for (const d of raw) {
@@ -38,7 +67,7 @@ export function normalizeDays(raw: unknown): string[] | null {
     uniq.add(d);
   }
   const days = [...uniq].sort();
-  return days.length > 0 && days.length <= 93 ? days : null;
+  return days.length > 0 ? days : null;
 }
 
 export function normalizeMarks(
