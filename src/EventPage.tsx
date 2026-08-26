@@ -1,6 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useAtomValue } from "@effect/atom-react";
-import { Effect } from "effect";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -11,22 +9,22 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { Check, Link2, X } from "lucide-react";
-import {
-  eventAtomFamily,
-  loadStoredMe,
-  lsKey,
-  AsyncResult,
-  type Me,
-} from "./atoms";
-import { saveMe, type EventData, type MarkState } from "./api";
+import { getEvent, saveMe, type EventData, type MarkState } from "./api";
 
 const FREE: MarkState = "free";
 const NO: MarkState = "no";
+const lsKey = (id: string) => `meetings.${id}.me`;
 const TODAY = new Date().toISOString().slice(0, 10);
 const PALETTE = [
   "#1f7a8c", "#b56576", "#6a994e", "#bc6c25",
   "#7209b7", "#3d5a80", "#e07a5f", "#2a9d8f",
 ];
+
+interface Me {
+  pid: string | null;
+  name: string;
+  marks: Record<string, MarkState>;
+}
 
 interface Person {
   pid: string;
@@ -36,14 +34,17 @@ interface Person {
 }
 
 export default function EventPage({ id }: { id: string }) {
-  const result = useAtomValue(eventAtomFamily(id));
-  const ev = AsyncResult.getOrElse(result, () => null);
-
-  const [me, setMe] = useState<Me>(() => loadStoredMe(id));
+  const [ev, setEv] = useState<EventData | null>(null);
+  const [notFound, setNotFound] = useState(false);
+  const [me, setMe] = useState<Me>({ pid: null, name: "", marks: {} });
   const [status, setStatusText] = useState("");
   const [tone, setTone] = useState<"idle" | "dirty" | "saved" | "error">("idle");
   const dirty = useRef(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const bump = useCallback(() => {
+    changeSeq.current++;
+  }, []);
+  // always-latest state for the debounced save (avoids stale closures)
   const meRef = useRef(me);
   meRef.current = me;
   const changeSeq = useRef(0);
@@ -53,18 +54,55 @@ export default function EventPage({ id }: { id: string }) {
     setTone(t);
   };
 
-  // Sync title and hydrate saved marks once event data arrives
+  // restore identity + load event
   useEffect(() => {
-    if (ev) {
-      document.title = `${ev.title} — meetings`;
-      if (!dirty.current && me.pid) {
-        const mine = ev.responses.find((r) => r.pid === me.pid);
-        if (mine) {
-          setMe((m) => ({ ...m, marks: { ...mine.marks } }));
-        }
-      }
-    }
-  }, [ev]);
+    let alive = true;
+    try {
+      const saved = JSON.parse(localStorage.getItem(lsKey(id)) || "null");
+      if (saved)
+        setMe((m) => ({
+          ...m,
+          pid: saved.pid || null,
+          name: saved.name || "",
+        }));
+    } catch {}
+    getEvent(id)
+      .then((data) => {
+        if (!alive) return;
+        setEv(data);
+        document.title = `${data.title} — meetings`;
+        // don't clobber edits the user made while the request was in flight
+        if (dirty.current) return;
+        setMe((m) => {
+          if (!m.pid) return m;
+          const mine = data.responses.find((r) => r.pid === m.pid);
+          return mine ? { ...m, marks: { ...mine.marks } } : m;
+        });
+      })
+      .catch(() => alive && setNotFound(true));
+    return () => {
+      alive = false;
+    };
+  }, [id]);
+
+  // polling
+  useEffect(() => {
+    if (!ev) return;
+    const t = setInterval(async () => {
+      if (document.hidden || dirty.current) return;
+      try {
+        const data = await getEvent(ev.id);
+        setEv((cur) => {
+          if (!cur) return cur;
+          const same =
+            JSON.stringify(data.responses.filter((r) => r.pid !== me.pid)) ===
+            JSON.stringify(cur.responses.filter((r) => r.pid !== me.pid));
+          return same ? cur : { ...cur, responses: data.responses };
+        });
+      } catch {}
+    }, 10000);
+    return () => clearInterval(t);
+  }, [ev, me.pid]);
 
   const scheduleSave = useCallback(() => {
     dirty.current = true;
@@ -80,14 +118,13 @@ export default function EventPage({ id }: { id: string }) {
       const seq = changeSeq.current;
       setStatus("Saving…", "dirty");
       try {
-        const res = await Effect.runPromise(
-          saveMe(id, { pid: pid ?? undefined, name: name.trim(), marks }),
-        );
+        const res = await saveMe(id, { pid, name: name.trim(), marks });
         setMe((cur) => ({ ...cur, pid: res.pid }));
         localStorage.setItem(
           lsKey(id),
           JSON.stringify({ pid: res.pid, name: name.trim() }),
         );
+        // stay dirty if the user edited while this save was in flight
         dirty.current = seq !== changeSeq.current;
         if (!dirty.current) setStatus("Saved", "saved");
       } catch {
@@ -98,8 +135,7 @@ export default function EventPage({ id }: { id: string }) {
 
   const applyMark = useCallback(
     (day: string, s: MarkState | null) => {
-      changeSeq.current++;
-      setMe((m) => {
+      changeSeq.current++;      setMe((m) => {
         const next = { ...m.marks };
         if (s) next[day] = s;
         else delete next[day];
@@ -118,11 +154,12 @@ export default function EventPage({ id }: { id: string }) {
     [applyMark],
   );
 
-  const bump = useCallback(() => {
-    changeSeq.current++;
-  }, []);
+  const join = useCallback(
+    (raw: string) => setMe((m) => ({ ...m, name: raw.trim() })),
+    [],
+  );
 
-  if (AsyncResult.isFailure(result)) {
+  if (notFound) {
     document.title = "meetings";
     return (
       <section className="rise py-20 text-center">
@@ -139,26 +176,15 @@ export default function EventPage({ id }: { id: string }) {
       </section>
     );
   }
-
-  if (!ev) {
+  if (!ev)
     return (
       <div className="rise py-16 font-mono text-muted-foreground">loading…</div>
     );
-  }
+
+  if (!me.name.trim()) return <NameGate ev={ev} onJoin={join} />;
 
   return (
-    <EventView
-      ev={ev}
-      me={me}
-      tone={tone}
-      status={status}
-      setStatus={setStatus}
-      scheduleSave={scheduleSave}
-      setMe={setMe}
-      onCycle={cycleDay}
-      onPaint={applyMark}
-      onEdit={bump}
-    />
+    <EventView ev={ev} me={me} tone={tone} status={status} setStatus={setStatus} scheduleSave={scheduleSave} setMe={setMe} onCycle={cycleDay} onPaint={applyMark} onEdit={bump} />
   );
 }
 
@@ -185,6 +211,7 @@ function EventView({
   onPaint: (day: string, s: MarkState | null) => void;
   onEdit: () => void;
 }) {
+  // who's being viewed: null = consensus, otherwise one person's days
   const [who, setWho] = useState<string | null>(null);
 
   const people: Person[] = useMemo(
@@ -196,8 +223,6 @@ function EventView({
     [ev.responses],
   );
   const selected = people.find((p) => p.pid === who);
-  const rangeEnd =
-    ev.days.length > 1 ? ` – ${fmtShort(ev.days[ev.days.length - 1])}` : "";
 
   return (
     <section className="flex flex-col gap-4 sm:gap-5">
@@ -211,7 +236,7 @@ function EventView({
         </h1>
         <p className="mt-2 font-mono text-xs text-muted-foreground sm:text-sm">
           {fmtShort(ev.days[0])}
-          {rangeEnd}
+          {ev.days.length > 1 && ` – ${fmtShort(ev.days[ev.days.length - 1])}`}
           {" · "}
           {ev.days.length} days · {ev.responses.length} response
           {ev.responses.length === 1 ? "" : "s"}
@@ -327,6 +352,63 @@ function EventView({
   );
 }
 
+/* ---------------- name gate ---------------- */
+
+function NameGate({ ev, onJoin }: { ev: EventData; onJoin: (name: string) => void }) {
+  const [value, setValue] = useState("");
+  const [shake, setShake] = useState(false);
+
+  const submit = () => {
+    if (!value.trim()) {
+      setShake(true);
+      setTimeout(() => setShake(false), 400);
+      return;
+    }
+    onJoin(value);
+  };
+
+  return (
+    <section className="rise flex min-h-[60vh] items-center justify-center">
+      <div className="w-full max-w-md rounded-2xl border bg-card p-6 shadow-md sm:p-8">
+        <span className="eyebrow">Availability</span>
+        <h1 className="mt-1 font-display text-2xl font-semibold tracking-tight break-words sm:text-3xl">
+          {ev.title}
+        </h1>
+        <p className="mt-2 font-mono text-xs text-muted-foreground sm:text-sm">
+          {fmtShort(ev.days[0])}
+          {ev.days.length > 1 && ` – ${fmtShort(ev.days[ev.days.length - 1])}`}
+          {" · "}
+          {ev.responses.length} response
+          {ev.responses.length === 1 ? "" : "s"}
+        </p>
+
+        <div className="mt-6 grid gap-2">
+          <Label htmlFor="gate-name">What's your name?</Label>
+          <Input
+            id="gate-name"
+            value={value}
+            maxLength={40}
+            autoComplete="off"
+            autoFocus
+            placeholder="Your name"
+            className={cn("h-12 rounded-xl text-base", shake && "animate-swap")}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                submit();
+              }
+            }}
+          />
+          <Button size="lg" className="mt-2 rounded-xl" onClick={submit}>
+            Enter your availability
+          </Button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 /* ---------------- month cards ---------------- */
 
 function MonthGrid({
@@ -346,12 +428,11 @@ function MonthGrid({
   const tallyMap = useMemo(() => tally(ev, me), [ev, me]);
   const picks = useMemo(() => topPicks(ev, me), [ev, me]);
 
+  // per-day name lists for tooltips ("who exactly is free / can't")
   const nameMap = useMemo(() => {
     const sources: { name: string; marks: Record<string, MarkState> }[] = [
       ...ev.responses.map((r) => ({ name: r.name, marks: r.marks })),
-      ...(me.pid
-        ? [{ name: `${me.name.trim() || "You"} (you)`, marks: me.marks }]
-        : [{ name: "You (unsaved)", marks: me.marks }]),
+      ...(me.pid ? [{ name: `${me.name.trim() || "You"} (you)`, marks: me.marks }] : [{ name: "You (unsaved)", marks: me.marks }]),
     ];
     const map = new Map<string, { free: string[]; no: string[] }>();
     for (const d of ev.days) map.set(d, { free: [], no: [] });
@@ -366,6 +447,7 @@ function MonthGrid({
     return map;
   }, [ev, me]);
 
+  // drag-to-paint state, shared across all month cards
   const paint = useRef<{ state: MarkState | null } | null>(null);
 
   const dayDown = useCallback(
@@ -558,14 +640,17 @@ function DayCell({
   const dow = new Date(day + "T00:00:00").getDay();
   const isWeekend = dow === 0 || dow === 6;
 
+  // viewing one person: their mark drives the cell
   const shown: MarkState | undefined =
     view ? (view.marks[day] ?? undefined) : (mine ?? undefined);
+  const isMineShown = !view && mine !== undefined;
 
   let tooltip = fmtLong(day);
   if (view) {
     tooltip += ` — ${view.name}: ${view.marks[day] ?? "no answer"}`;
   } else {
-    if (names.free.length) tooltip += `\nFree: ${names.free.join(", ")}`;
+    if (names.free.length)
+      tooltip += `\nFree: ${names.free.join(", ")}`;
     if (names.no.length) tooltip += `\nCan't: ${names.no.join(", ")}`;
     if (!names.free.length && !names.no.length)
       tooltip += "\nNo one has marked this day yet";
@@ -574,40 +659,42 @@ function DayCell({
   return (
     <button
       type="button"
+      // mouse/pen: apply on down, drag paints via onEnter; no click involved
       onPointerDown={(e) => {
         if (!editable) return;
         if (e.pointerType !== "touch") {
-          e.preventDefault();
+          e.preventDefault(); // no compatibility mouse events / click
           onDown(day);
         }
       }}
+      // touch: implicit pointer capture kills enter events during drags,
+      // so a tap is detected on release instead
       onPointerUp={(e) => {
         if (editable && e.pointerType === "touch") onTap(day);
       }}
       onPointerEnter={() => editable && onEnter(day)}
-      disabled={!editable}
+      disabled={!!view}
       title={tooltip}
       aria-label={`${fmtLong(day)}: ${
-        view
-          ? `${view.name} ${view.marks[day] ?? "no answer"}`
-          : `${t.free} free, ${t.no} can't`
+        view ? `${view.name} ${view.marks[day] ?? "no answer"}` : `${t.free} free, ${t.no} can't`
       }`}
       className={cn(
         "relative grid aspect-square w-full select-none place-items-center rounded-lg border text-[11px] font-medium transition-transform duration-100",
         "hover:z-10 hover:scale-110 focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-1",
         editable && "active:scale-95 cursor-pointer",
-        !editable && "cursor-default",
+        view && "cursor-default",
         shown === FREE && "cell-free border-transparent shadow-sm",
         shown === NO && "cell-no border-transparent",
-        !shown && !isWeekend && "border-transparent bg-secondary/60",
+        !shown &&
+          !isWeekend &&
+          "border-transparent bg-secondary/60",
         !shown && isWeekend && "border-transparent bg-secondary/30",
+        // faint consensus wash behind a person's "no answer" cells
         view && !shown && frac > 0 && "opacity-90",
       )}
       style={
         !shown && frac > 0
-          ? {
-              backgroundColor: `rgba(23, 149, 79, ${(frac * 0.45).toFixed(3)})`,
-            }
+          ? { backgroundColor: `rgba(23, 149, 79, ${(frac * 0.45).toFixed(3)})` }
           : undefined
       }
     >
