@@ -59,8 +59,12 @@ export default function EventPage({ id }: { id: string }) {
     let alive = true;
     try {
       const saved = JSON.parse(localStorage.getItem(lsKey(id)) || "null");
-      if (saved?.pid)
-        setMe((m) => ({ ...m, pid: saved.pid, name: saved.name || "" }));
+      if (saved)
+        setMe((m) => ({
+          ...m,
+          pid: saved.pid || null,
+          name: saved.name || "",
+        }));
     } catch {}
     getEvent(id)
       .then((data) => {
@@ -150,6 +154,11 @@ export default function EventPage({ id }: { id: string }) {
     [applyMark],
   );
 
+  const join = useCallback(
+    (raw: string) => setMe((m) => ({ ...m, name: raw.trim() })),
+    [],
+  );
+
   if (notFound) {
     document.title = "meetings";
     return (
@@ -171,6 +180,8 @@ export default function EventPage({ id }: { id: string }) {
     return (
       <div className="rise py-16 font-mono text-muted-foreground">loading…</div>
     );
+
+  if (!me.name.trim()) return <NameGate ev={ev} onJoin={join} />;
 
   return (
     <EventView ev={ev} me={me} tone={tone} status={status} setStatus={setStatus} scheduleSave={scheduleSave} setMe={setMe} onCycle={cycleDay} onPaint={applyMark} onEdit={bump} />
@@ -337,6 +348,63 @@ function EventView({
         drag to paint · tap once for free · twice for can't
         {selected && ` · viewing ${selected.name}'s days`}
       </p>
+    </section>
+  );
+}
+
+/* ---------------- name gate ---------------- */
+
+function NameGate({ ev, onJoin }: { ev: EventData; onJoin: (name: string) => void }) {
+  const [value, setValue] = useState("");
+  const [shake, setShake] = useState(false);
+
+  const submit = () => {
+    if (!value.trim()) {
+      setShake(true);
+      setTimeout(() => setShake(false), 400);
+      return;
+    }
+    onJoin(value);
+  };
+
+  return (
+    <section className="rise flex min-h-[60vh] items-center justify-center">
+      <div className="w-full max-w-md rounded-2xl border bg-card p-6 shadow-md sm:p-8">
+        <span className="eyebrow">Availability</span>
+        <h1 className="mt-1 font-display text-2xl font-semibold tracking-tight break-words sm:text-3xl">
+          {ev.title}
+        </h1>
+        <p className="mt-2 font-mono text-xs text-muted-foreground sm:text-sm">
+          {fmtShort(ev.days[0])}
+          {ev.days.length > 1 && ` – ${fmtShort(ev.days[ev.days.length - 1])}`}
+          {" · "}
+          {ev.responses.length} response
+          {ev.responses.length === 1 ? "" : "s"}
+        </p>
+
+        <div className="mt-6 grid gap-2">
+          <Label htmlFor="gate-name">What's your name?</Label>
+          <Input
+            id="gate-name"
+            value={value}
+            maxLength={40}
+            autoComplete="off"
+            autoFocus
+            placeholder="Your name"
+            className={cn("h-12 rounded-xl text-base", shake && "animate-swap")}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                submit();
+              }
+            }}
+          />
+          <Button size="lg" className="mt-2 rounded-xl" onClick={submit}>
+            Enter your availability
+          </Button>
+        </div>
+      </div>
     </section>
   );
 }

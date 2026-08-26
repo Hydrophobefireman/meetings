@@ -1,103 +1,63 @@
 import { Hono } from "hono";
-import {
-  cleanName,
-  cleanTitle,
-  normalizeDays,
-  normalizeMarks,
-  rid,
-  validPid,
-  type EventMeta,
-  type ResponseRec,
-} from "./lib";
+import type { Context } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { Effect } from "effect";
+import { KV } from "./kv";
+import { BadRequest, createEvent, getEvent, Internal, NotFound, saveResponse } from "./ops";
+import { layerFrom } from "./kv";
 
 type Bindings = {
   Store: KVNamespace;
   ASSETS: Fetcher;
 };
 
+type C = Context<{ Bindings: Bindings }>;
+
 const app = new Hono<{ Bindings: Bindings }>();
 
-const eventKey = (id: string) => `event:${id}`;
-const respKey = (id: string, pid: string) => `resp:${id}:${pid}`;
-const indexKey = (id: string) => `resp-index:${id}`;
-
-app.onError((err, c) => {
-  console.error(err);
-  return c.json({ error: "internal_error" }, 500);
-});
-
-app.post("/api/events", async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => null);
-  if (!body) return c.json({ error: "bad_request" }, 400);
-
-  const title = cleanTitle(body.title);
-  // accepts { start, end } range or a legacy days array
-  const days = normalizeDays(body.days ?? body);
-  if (!title || !days) return c.json({ error: "bad_request" }, 400);
-
-  let id = rid(7);
-  for (let i = 0; i < 3; i++) {
-    if (!(await c.env.Store.get(eventKey(id)))) break;
-    id = rid(7);
-  }
-
-  const meta: EventMeta = { id, title, days, created: Date.now() };
-  await c.env.Store.put(eventKey(id), JSON.stringify(meta));
-  return c.json({ id }, 201);
-});
-
-app.get("/api/events/:id", async (c) => {
-  const id = c.req.param("id");
-  const meta = await c.env.Store.get<EventMeta>(eventKey(id), "json");
-  if (!meta) return c.json({ error: "not_found" }, 404);
-
-  const index = (await c.env.Store.get<string[]>(indexKey(id), "json")) ?? [];
-  const responses = (
-    await Promise.all(
-      index.map((pid) => c.env.Store.get<ResponseRec>(respKey(id, pid), "json")),
-    )
-  ).filter((r): r is ResponseRec => r !== null);
-  responses.sort((a, b) => a.at - b.at);
-
-  return c.json({
-    id: meta.id,
-    title: meta.title,
-    days: meta.days,
-    responses,
-  });
-});
-
-app.put("/api/events/:id/me", async (c) => {
-  const id = c.req.param("id");
-  const meta = await c.env.Store.get<EventMeta>(eventKey(id), "json");
-  if (!meta) return c.json({ error: "not_found" }, 404);
-
-  const body = await c.req.json<Record<string, unknown>>().catch(() => null);
-  const name = body ? cleanName(body.name) : null;
-  if (!body || !name) return c.json({ error: "bad_request" }, 400);
-
-  const pid = validPid(body.pid) ?? rid(12);
-  const key = respKey(id, pid);
-  const prev = body.pid ? await c.env.Store.get<ResponseRec>(key, "json") : null;
-
-  const rec: ResponseRec = {
-    pid,
-    name,
-    marks: normalizeMarks(meta, body.marks),
-    at: prev?.at ?? Date.now(),
-  };
-  await c.env.Store.put(key, JSON.stringify(rec));
-
-  const index = new Set(
-    (await c.env.Store.get<string[]>(indexKey(id), "json")) ?? [],
+/**
+ * Runs an Effect with the KV layer for this request and maps typed
+ * errors onto HTTP responses.
+ */
+function handle<T>(
+  c: C,
+  eff: Effect.Effect<T, BadRequest | NotFound | Internal, KV>,
+  status: ContentfulStatusCode = 200,
+): Promise<Response> {
+  return Effect.runPromise(
+    Effect.provide(Effect.either(eff), layerFrom(c.env.Store)),
+  ).then(
+    (result) => {
+      if (result._tag === "Right") return c.json(result.right, status);
+      const err = result.left;
+      if (err._tag === "BadRequest") return c.json({ error: "bad_request" }, 400);
+      if (err._tag === "NotFound") return c.json({ error: "not_found" }, 404);
+      console.error(err);
+      return c.json({ error: "internal_error" }, 500);
+    },
+    (err) => {
+      // defects (unexpected throws inside the Effect)
+      console.error(err);
+      return c.json({ error: "internal_error" }, 500);
+    },
   );
-  if (!index.has(pid)) {
-    index.add(pid);
-    await c.env.Store.put(indexKey(id), JSON.stringify([...index]));
-  }
+}
 
-  return c.json({ pid });
-});
+app.post("/api/events", (c) =>
+  c.req
+    .json<unknown>()
+    .catch(() => undefined)
+    .then((body) => handle(c, createEvent(body), 201)),
+);
+
+app.get("/api/events/:id", (c) => handle(c, getEvent(c.req.param("id"))));
+
+app.put("/api/events/:id/me", (c) =>
+  c.req
+    .json<unknown>()
+    .catch(() => undefined)
+    .then((body) => handle(c, saveResponse(c.req.param("id"), body))),
+);
 
 app.notFound(async (c) => {
   if (c.req.path.startsWith("/api/")) {
