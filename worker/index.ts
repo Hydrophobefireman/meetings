@@ -1,69 +1,104 @@
-import { Hono } from "hono";
-import type { Context } from "hono";
-import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { Effect } from "effect";
-import { KV } from "./kv";
-import { BadRequest, createEvent, getEvent, Internal, NotFound, saveResponse } from "./ops";
-import { layerFrom } from "./kv";
+import { layerFrom, KV } from "./kv";
+import { createEvent, getEvent, saveResponse, type BadRequest, type NotFound, type Internal } from "./ops";
+import { CreateEventBody, SaveResponseBody } from "./schema";
 
 type Bindings = {
   Store: KVNamespace;
   ASSETS: Fetcher;
 };
 
-type C = Context<{ Bindings: Bindings }>;
-
-const app = new Hono<{ Bindings: Bindings }>();
-
-/**
- * Runs an Effect with the KV layer for this request and maps typed
- * errors onto HTTP responses.
- */
-function handle<T>(
-  c: C,
-  eff: Effect.Effect<T, BadRequest | NotFound | Internal, KV>,
-  status: ContentfulStatusCode = 200,
-): Promise<Response> {
-  return Effect.runPromise(
-    Effect.provide(Effect.either(eff), layerFrom(c.env.Store)),
-  ).then(
-    (result) => {
-      if (result._tag === "Right") return c.json(result.right, status);
-      const err = result.left;
-      if (err._tag === "BadRequest") return c.json({ error: "bad_request" }, 400);
-      if (err._tag === "NotFound") return c.json({ error: "not_found" }, 404);
-      console.error(err);
-      return c.json({ error: "internal_error" }, 500);
-    },
-    (err) => {
-      // defects (unexpected throws inside the Effect)
-      console.error(err);
-      return c.json({ error: "internal_error" }, 500);
-    },
+/** Convert domain errors into typed JSON HTTP responses. */
+const respond = <A>(
+  eff: Effect.Effect<A, BadRequest | NotFound | Internal, KV>,
+  status = 200,
+) =>
+  eff.pipe(
+    Effect.flatMap((a) => HttpServerResponse.json(a, { status })),
+    Effect.catchTags({
+      BadRequest: () =>
+        HttpServerResponse.json({ error: "bad_request" }, { status: 400 }),
+      NotFound: () =>
+        HttpServerResponse.json({ error: "not_found" }, { status: 404 }),
+      Internal: (e) =>
+        Effect.logError(e.cause).pipe(
+          Effect.andThen(
+            HttpServerResponse.json({ error: "internal_error" }, { status: 500 }),
+          ),
+        ),
+    }),
   );
-}
 
-app.post("/api/events", (c) =>
-  c.req
-    .json<unknown>()
-    .catch(() => undefined)
-    .then((body) => handle(c, createEvent(body), 201)),
+/* ---------------- routes ---------------- */
+
+const createRoute = Effect.gen(function* () {
+  const body = yield* HttpServerRequest.schemaBodyJson(CreateEventBody);
+  return yield* respond(createEvent(body), 201);
+}).pipe(
+  Effect.catchTags({
+    ParseError: () =>
+      HttpServerResponse.json({ error: "bad_request" }, { status: 400 }),
+    RequestError: () =>
+      HttpServerResponse.json({ error: "bad_request" }, { status: 400 }),
+  }),
 );
 
-app.get("/api/events/:id", (c) => handle(c, getEvent(c.req.param("id"))));
-
-app.put("/api/events/:id/me", (c) =>
-  c.req
-    .json<unknown>()
-    .catch(() => undefined)
-    .then((body) => handle(c, saveResponse(c.req.param("id"), body))),
-);
-
-app.notFound(async (c) => {
-  if (c.req.path.startsWith("/api/")) {
-    return c.json({ error: "not_found" }, 404);
-  }
-  return c.env.ASSETS.fetch(c.req.raw);
+const getRoute = Effect.gen(function* () {
+  const req = yield* HttpServerRequest.HttpServerRequest;
+  const id = req.url.split("/").filter(Boolean).pop() ?? "";
+  return yield* respond(getEvent(id));
 });
 
-export default app;
+const saveRoute = Effect.gen(function* () {
+  const req = yield* HttpServerRequest.HttpServerRequest;
+  const segments = req.url.split("/").filter(Boolean);
+  // /api/events/:id/me -> segments[-2]
+  const id = segments[segments.length - 2] ?? "";
+  const body = yield* HttpServerRequest.schemaBodyJson(SaveResponseBody);
+  return yield* respond(saveResponse(id, body));
+}).pipe(
+  Effect.catchTags({
+    ParseError: () =>
+      HttpServerResponse.json({ error: "bad_request" }, { status: 400 }),
+    RequestError: () =>
+      HttpServerResponse.json({ error: "bad_request" }, { status: 400 }),
+  }),
+);
+
+export const router = HttpRouter.empty.pipe(
+  HttpRouter.post("/api/events", createRoute),
+  HttpRouter.get("/api/events/:id", getRoute),
+  HttpRouter.put("/api/events/:id/me", saveRoute),
+);
+
+/* ---------------- worker fetch entrypoint ---------------- */
+
+export default {
+  async fetch(request: Request, env: Bindings): Promise<Response> {
+    const url = new URL(request.url);
+    if (!url.pathname.startsWith("/api/")) {
+      return env.ASSETS.fetch(request);
+    }
+    return Effect.runPromise(
+      router.pipe(
+        Effect.provideService(
+          HttpServerRequest.HttpServerRequest,
+          HttpServerRequest.fromWeb(request),
+        ),
+        Effect.provide(layerFrom(env.Store)),
+        Effect.scoped,
+        Effect.map((res) => HttpServerResponse.toWeb(res)),
+        Effect.catchAllDefect((defect) => {
+          console.error(defect);
+          return Effect.succeed(
+            new Response(JSON.stringify({ error: "internal_error" }), {
+              status: 500,
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        }),
+      ),
+    );
+  },
+};

@@ -1,15 +1,7 @@
-import { Data, Effect } from "effect";
-import {
-  cleanName,
-  cleanTitle,
-  normalizeDays,
-  normalizeMarks,
-  rid,
-  validPid,
-  type EventMeta,
-  type ResponseRec,
-} from "./lib";
-import { KV, KVError, layerFrom, withRetry } from "./kv";
+import { Data, Effect, type Schema } from "effect";
+import { normalizeDays, normalizeMarks, rid, type EventMeta, type ResponseRec } from "./lib";
+import { KV, KVError, withRetry } from "./kv";
+import type { CreateEventBody, SaveResponseBody } from "./schema";
 
 /* ---------------- typed errors ---------------- */
 
@@ -31,14 +23,14 @@ const indexKey = (id: string) => `resp-index:${id}`;
 
 /* ---------------- operations ---------------- */
 
-export const createEvent = (body: unknown) =>
+export const createEvent = (
+  body: Schema.Schema.Type<typeof CreateEventBody>,
+) =>
   Effect.gen(function* () {
     const kv = yield* KV;
-    const b = (body ?? {}) as Record<string, unknown>;
-    const title = cleanTitle(b.title);
     // accepts { start, end } range or a legacy days array
-    const days = normalizeDays(b.days ?? b);
-    if (!title || !days) return yield* Effect.fail(new BadRequest());
+    const days = normalizeDays("days" in body ? body.days : body);
+    if (!days) return yield* Effect.fail(new BadRequest());
 
     let id = rid(7);
     for (let i = 0; i < 3; i++) {
@@ -47,7 +39,7 @@ export const createEvent = (body: unknown) =>
       id = rid(7);
     }
 
-    const meta: EventMeta = { id, title, days, created: Date.now() };
+    const meta: EventMeta = { id, title: body.title, days, created: Date.now() };
     yield* withRetry(kv.putJSON(eventKey(id), meta));
     return { id };
   }).pipe(Effect.mapError((e) => (e instanceof KVError ? new Internal(e.cause) : e)));
@@ -73,24 +65,23 @@ export const getEvent = (id: string) =>
     };
   }).pipe(Effect.mapError((e) => (e instanceof KVError ? new Internal(e.cause) : e)));
 
-export const saveResponse = (id: string, body: unknown) =>
+export const saveResponse = (
+  id: string,
+  body: Schema.Schema.Type<typeof SaveResponseBody>,
+) =>
   Effect.gen(function* () {
     const kv = yield* KV;
 
     const meta = yield* kv.getJSON<EventMeta>(eventKey(id));
     if (meta === null) return yield* Effect.fail(new NotFound());
 
-    const b = (body ?? {}) as Record<string, unknown>;
-    const name = cleanName(b.name);
-    if (!name) return yield* Effect.fail(new BadRequest());
-
-    const pid = validPid(b.pid) ?? rid(12);
-    const prev = b.pid ? yield* kv.getJSON<ResponseRec>(respKey(id, pid)) : null;
+    const pid = body.pid ?? rid(12);
+    const prev = body.pid ? yield* kv.getJSON<ResponseRec>(respKey(id, pid)) : null;
 
     const rec: ResponseRec = {
       pid,
-      name,
-      marks: normalizeMarks(meta, b.marks),
+      name: body.name,
+      marks: normalizeMarks(meta, (body.marks ?? {}) as Record<string, unknown>),
       at: prev?.at ?? Date.now(),
     };
     yield* withRetry(kv.putJSON(respKey(id, pid), rec));
