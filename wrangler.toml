@@ -1,0 +1,7 @@
+name = "meetings"
+main = "worker/index.ts"
+compatibility_date = "2024-09-23"
+
+[[kv_namespaces]]
+binding = "Store"
+id = "meetings_store_dev"
