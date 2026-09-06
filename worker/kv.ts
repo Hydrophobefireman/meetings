@@ -11,6 +11,7 @@ export class KV extends Context.Tag("meetings/KV")<KV, KVShape>() {}
 export interface KVShape {
   readonly getJSON: <A>(key: string) => Effect.Effect<A | null, KVError>;
   readonly putJSON: <A>(key: string, value: A) => Effect.Effect<void, KVError>;
+  readonly delete: (key: string) => Effect.Effect<void, KVError>;
 }
 
 export class KVError {
@@ -40,6 +41,11 @@ const make = (store: KVNamespace): KVShape => ({
   putJSON: (key, value) =>
     Effect.tryPromise({
       try: () => store.put(key, JSON.stringify(value)),
+      catch: (cause) => new KVError(cause),
+    }),
+  delete: (key: string) =>
+    Effect.tryPromise({
+      try: () => store.delete(key),
       catch: (cause) => new KVError(cause),
     }),
 });

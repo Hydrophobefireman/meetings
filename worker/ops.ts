@@ -60,16 +60,35 @@ export const getEvent = (id: string) =>
     if (meta === null) return yield* Effect.fail(new NotFound());
 
     const index = (yield* kv.getJSON<string[]>(indexKey(id))) ?? [];
-    const responses = yield* Effect.all(
+    const rawResponses = yield* Effect.all(
       index.map((pid) => kv.getJSON<ResponseRec>(respKey(id, pid))),
       { concurrency: "unbounded" },
     ).pipe(Effect.map((rs) => rs.filter((r): r is ResponseRec => r !== null)));
+
+    // Ensure responses are deduplicated by name (case-insensitive) in case legacy duplicates exist
+    const byName = new Map<string, ResponseRec>();
+    for (const r of rawResponses.sort((a, b) => a.at - b.at)) {
+      const key = r.name.trim().toLowerCase();
+      const existing = byName.get(key);
+      if (existing) {
+        byName.set(key, {
+          pid: existing.pid,
+          name: r.name,
+          marks: { ...existing.marks, ...r.marks },
+          at: r.at,
+        });
+      } else {
+        byName.set(key, r);
+      }
+    }
+
+    const responses = Array.from(byName.values()).sort((a, b) => a.at - b.at);
 
     return {
       id: meta.id,
       title: meta.title,
       days: meta.days,
-      responses: responses.sort((a, b) => a.at - b.at),
+      responses,
     };
   }).pipe(Effect.mapError((e) => (e instanceof KVError ? new Internal(e.cause) : e)));
 
@@ -84,22 +103,56 @@ export const saveResponse = (id: string, body: unknown) =>
     const name = cleanName(b.name);
     if (!name) return yield* Effect.fail(new BadRequest());
 
-    const pid = validPid(b.pid) ?? rid(12);
-    const prev = b.pid ? yield* kv.getJSON<ResponseRec>(respKey(id, pid)) : null;
+    const reqPid = validPid(b.pid);
+    const indexList = (yield* kv.getJSON<string[]>(indexKey(id))) ?? [];
+    const existingResponses = yield* Effect.all(
+      indexList.map((p) => kv.getJSON<ResponseRec>(respKey(id, p))),
+      { concurrency: "unbounded" },
+    ).pipe(Effect.map((rs) => rs.filter((r): r is ResponseRec => r !== null)));
 
-    const rec: ResponseRec = {
-      pid,
-      name,
-      marks: normalizeMarks(meta, b.marks),
-      at: prev?.at ?? Date.now(),
-    };
-    yield* withRetry(kv.putJSON(respKey(id, pid), rec));
+    const lowerName = name.trim().toLowerCase();
+    const existingByName = existingResponses.find(
+      (r) => r.name.trim().toLowerCase() === lowerName,
+    );
+    const existingByPid = reqPid
+      ? existingResponses.find((r) => r.pid === reqPid)
+      : null;
 
-    const index = new Set((yield* kv.getJSON<string[]>(indexKey(id))) ?? []);
-    if (!index.has(pid)) {
-      index.add(pid);
-      yield* withRetry(kv.putJSON(indexKey(id), [...index]));
+    let targetPid: string;
+    let originalAt = Date.now();
+
+    if (existingByName) {
+      // Attach to the existing person with the same name
+      targetPid = existingByName.pid;
+      originalAt = existingByName.at;
+
+      // If the caller had a different old PID, delete the orphaned record from KV
+      if (reqPid && reqPid !== targetPid && existingByPid) {
+        yield* withRetry(kv.delete(respKey(id, reqPid)));
+      }
+    } else if (existingByPid) {
+      // Renaming an existing participant to a new unique name
+      targetPid = existingByPid.pid;
+      originalAt = existingByPid.at;
+    } else {
+      // New participant
+      targetPid = reqPid ?? rid(12);
+      originalAt = Date.now();
     }
 
-    return { pid };
+    const rec: ResponseRec = {
+      pid: targetPid,
+      name,
+      marks: normalizeMarks(meta, b.marks),
+      at: originalAt,
+    };
+    yield* withRetry(kv.putJSON(respKey(id, targetPid), rec));
+
+    const updatedIndex = new Set(
+      indexList.filter((p) => !reqPid || reqPid === targetPid || p !== reqPid),
+    );
+    updatedIndex.add(targetPid);
+    yield* withRetry(kv.putJSON(indexKey(id), [...updatedIndex]));
+
+    return { pid: targetPid };
   }).pipe(Effect.mapError((e) => (e instanceof KVError ? new Internal(e.cause) : e)));
